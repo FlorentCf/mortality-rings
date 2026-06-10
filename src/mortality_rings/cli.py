@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.collections import LineCollection
-from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm, to_rgb
+from matplotlib.colors import Colormap, TwoSlopeNorm, to_rgb
 
 
 STATBEL_URL = "https://statbel.fgov.be/sites/default/files/files/opendata/bevolking/TF_DEATHS.zip"
@@ -34,15 +34,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--last-year", type=int, default=None, help="Last visible year. Defaults to data maximum.")
     parser.add_argument("--baseline-start", type=int, default=1992, help="First baseline year.")
     parser.add_argument("--baseline-end", type=int, default=2019, help="Last baseline year.")
-    parser.add_argument("--people-per-cell", type=float, default=45, help="Deaths represented by one deposited cell.")
+    parser.add_argument("--people-per-cell", type=float, default=25, help="Deaths represented by one deposited cell.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for deterministic cell deposition.")
-    parser.add_argument("--cell-growth", type=float, default=0.0029, help="How strongly each cell grows the bark.")
+    parser.add_argument("--cell-growth", type=float, default=0.0018, help="How strongly each cell grows the bark.")
     parser.add_argument("--ring-rest", type=float, default=0.012, help="Quiet growth added after each year's cells.")
-    parser.add_argument("--five-year-gap", type=float, default=0.16, help="Extra pale resting band after five-year intervals.")
-    parser.add_argument("--cell-min-length", type=float, default=0.021, help="Minimum rendered cell length.")
-    parser.add_argument("--cell-max-length", type=float, default=0.052, help="Maximum rendered cell length.")
-    parser.add_argument("--clip-low", type=float, default=-0.25, help="Low color clipping bound, e.g. -0.25.")
-    parser.add_argument("--clip-high", type=float, default=0.55, help="High color clipping bound, e.g. 0.55.")
+    parser.add_argument("--five-year-gap", type=float, default=0.055, help="Extra pale resting band after five-year intervals.")
+    parser.add_argument("--cell-min-length", type=float, default=0.013, help="Minimum rendered cell length.")
+    parser.add_argument("--cell-max-length", type=float, default=0.034, help="Maximum rendered cell length.")
+    parser.add_argument("--clip-low", type=float, default=-0.18, help="Low color clipping bound, e.g. -0.18.")
+    parser.add_argument("--clip-high", type=float, default=0.40, help="High color clipping bound, e.g. 0.40.")
+    parser.add_argument("--colormap", default="turbo", help="Matplotlib colormap for seasonal excess.")
     parser.add_argument("--title", default="Belgium mortality tree", help="Chart title.")
     parser.add_argument("--subtitle", default=None, help="Chart subtitle.")
     parser.add_argument("--source-note", default=None, help="Footer source note.")
@@ -190,11 +191,11 @@ def season_tint(theta: np.ndarray) -> np.ndarray:
     )
 
 
-def cell_colors(cells: pd.DataFrame, cmap: LinearSegmentedColormap, norm: TwoSlopeNorm) -> np.ndarray:
+def cell_colors(cells: pd.DataFrame, cmap: Colormap, norm: TwoSlopeNorm) -> np.ndarray:
     excess = cells["seasonal_excess_pct"].clip(norm.vmin, norm.vmax).fillna(0)
     excess_rgb = cmap(norm(excess))[:, :3]
     tint_rgb = season_tint(cells["theta"].to_numpy())
-    rgb = 0.58 * excess_rgb + 0.42 * tint_rgb
+    rgb = 0.92 * excess_rgb + 0.08 * tint_rgb
     alpha = cells["alpha"].to_numpy() if "alpha" in cells else np.full(len(cells), 0.9)
     return np.column_stack([np.clip(rgb, 0, 1), alpha])
 
@@ -207,6 +208,7 @@ def simulate_cells(daily: pd.DataFrame, args: argparse.Namespace) -> pd.DataFram
     rows: list[dict[str, float]] = []
 
     for year, year_days in daily.groupby("year", sort=True):
+        typical_deaths = max(float(year_days["deaths"].median()), 1.0)
         events = year_days.sample(frac=1, random_state=int(rng.integers(0, 2**32 - 1)))
         for record in events.itertuples(index=False):
             if not np.isfinite(record.deaths) or record.deaths <= 0:
@@ -238,14 +240,15 @@ def simulate_cells(daily: pd.DataFrame, args: argparse.Namespace) -> pd.DataFram
                         "y2": y[0] + direction[1] * length / 2,
                         "theta": theta,
                         "seasonal_excess_pct": record.seasonal_excess_pct,
-                        "line_width": rng.uniform(0.42, 1.02) * radial_scale,
-                        "alpha": 0.04 + 0.54 * ink_strength,
+                        "line_width": rng.uniform(0.32, 0.78) * radial_scale,
+                        "alpha": 0.035 + 0.42 * ink_strength,
                     }
                 )
 
                 spread = 0.024 + 0.026 * rng.random()
                 local_bias = 0.72 + 0.68 * (cambium_bias[index] + 1) / 2
-                growth = args.cell_growth * local_bias * rng.uniform(0.55, 1.35)
+                death_pressure = np.clip((record.deaths / typical_deaths) ** 0.55, 0.72, 1.75)
+                growth = args.cell_growth * local_bias * death_pressure * rng.uniform(0.55, 1.35)
                 distance = angular_distance(theta_grid, theta)
                 boundary += growth * np.exp(-0.5 * (distance / spread) ** 2)
 
@@ -260,12 +263,8 @@ def simulate_cells(daily: pd.DataFrame, args: argparse.Namespace) -> pd.DataFram
     return pd.DataFrame(rows)
 
 
-def make_palette() -> tuple[LinearSegmentedColormap, TwoSlopeNorm]:
-    cmap = LinearSegmentedColormap.from_list(
-        "mortality_cells",
-        ["#16344b", "#6f9fa9", "#eadabb", "#cc8244", "#a62a3a", "#2d101d"],
-    )
-    return cmap, TwoSlopeNorm(vmin=-0.25, vcenter=0, vmax=0.55)
+def make_palette(args: argparse.Namespace) -> tuple[Colormap, TwoSlopeNorm]:
+    return plt.get_cmap(args.colormap), TwoSlopeNorm(vmin=args.clip_low, vcenter=0, vmax=args.clip_high)
 
 
 def add_figure_text(fig: plt.Figure, args: argparse.Namespace, first_year: int, last_year: int) -> None:
@@ -283,10 +282,10 @@ def add_figure_text(fig: plt.Figure, args: argparse.Namespace, first_year: int, 
     fig.text(0.5, 0.029, method, ha="center", va="center", fontsize=8.7, color="#756f64")
 
 
-def add_colorbar(fig: plt.Figure, cmap: LinearSegmentedColormap, norm: TwoSlopeNorm) -> None:
+def add_colorbar(fig: plt.Figure, cmap: Colormap, norm: TwoSlopeNorm) -> None:
     legend_ax = fig.add_axes([0.31, 0.083, 0.38, 0.018])
-    gradient = np.linspace(norm.vmin, norm.vmax, 256).reshape(1, -1)
-    legend_ax.imshow(gradient, aspect="auto", cmap=cmap, norm=norm)
+    gradient = np.linspace(0, 1, 256).reshape(1, -1)
+    legend_ax.imshow(gradient, aspect="auto", cmap=cmap)
     legend_ax.set_yticks([])
     legend_ax.set_xticks([0, 64, 128, 192, 255])
     legend_ax.set_xticklabels(
@@ -303,7 +302,7 @@ def draw_frame(
     cells: pd.DataFrame,
     max_extent: float,
     year: int,
-    cmap: LinearSegmentedColormap,
+    cmap: Colormap,
     norm: TwoSlopeNorm,
     annual_totals: pd.Series,
 ) -> None:
@@ -341,11 +340,14 @@ def draw_frame(
 
 
 def render(args: argparse.Namespace) -> list[Path]:
-    daily = add_calendar_fields(load_daily_deaths(args))
-    first_year = args.first_year or int(daily["year"].min())
-    last_year = args.last_year or int(daily["year"].max())
-    daily = daily.query("@first_year <= year <= @last_year").copy()
-    weekly = build_weekly_data(daily, first_year, last_year, args.baseline_start, args.baseline_end)
+    all_daily = add_calendar_fields(load_daily_deaths(args))
+    first_year = args.first_year or int(all_daily["year"].min())
+    last_year = args.last_year or int(all_daily["year"].max())
+    context_start = min(first_year, args.baseline_start)
+    context_end = max(last_year, args.baseline_end)
+    weekly_source = all_daily.query("@context_start <= year <= @context_end").copy()
+    weekly = build_weekly_data(weekly_source, context_start, context_end, args.baseline_start, args.baseline_end)
+    daily = all_daily.query("@first_year <= year <= @last_year").copy()
     daily = attach_weekly_context(daily, weekly)
     cells = simulate_cells(daily, args)
     if cells.empty:
@@ -355,9 +357,7 @@ def render(args: argparse.Namespace) -> list[Path]:
     years = sorted(annual_totals.index)
     max_extent = float(np.nanmax(np.abs(cells[["x1", "y1", "x2", "y2"]].to_numpy()))) * 1.11
 
-    cmap, norm = make_palette()
-    norm.vmin = args.clip_low
-    norm.vmax = args.clip_high
+    cmap, norm = make_palette(args)
 
     plt.rcParams.update({"font.family": "DejaVu Sans", "figure.facecolor": "#fbf7ef", "savefig.facecolor": "#fbf7ef"})
     fig, ax = plt.subplots(figsize=(10.8, 10.8), dpi=150)
