@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.collections import LineCollection
-from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm, to_rgb
 
 
 STATBEL_URL = "https://statbel.fgov.be/sites/default/files/files/opendata/bevolking/TF_DEATHS.zip"
@@ -34,12 +34,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--last-year", type=int, default=None, help="Last visible year. Defaults to data maximum.")
     parser.add_argument("--baseline-start", type=int, default=1992, help="First baseline year.")
     parser.add_argument("--baseline-end", type=int, default=2019, help="Last baseline year.")
-    parser.add_argument("--people-per-cell", type=float, default=85, help="Deaths represented by one deposited cell.")
+    parser.add_argument("--people-per-cell", type=float, default=45, help="Deaths represented by one deposited cell.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for deterministic cell deposition.")
-    parser.add_argument("--cell-growth", type=float, default=0.0057, help="How strongly each cell grows the bark.")
-    parser.add_argument("--ring-rest", type=float, default=0.045, help="Quiet gap added after each year's growth.")
-    parser.add_argument("--cell-min-length", type=float, default=0.014, help="Minimum rendered cell length.")
-    parser.add_argument("--cell-max-length", type=float, default=0.038, help="Maximum rendered cell length.")
+    parser.add_argument("--cell-growth", type=float, default=0.0029, help="How strongly each cell grows the bark.")
+    parser.add_argument("--ring-rest", type=float, default=0.012, help="Quiet growth added after each year's cells.")
+    parser.add_argument("--five-year-gap", type=float, default=0.16, help="Extra pale resting band after five-year intervals.")
+    parser.add_argument("--cell-min-length", type=float, default=0.021, help="Minimum rendered cell length.")
+    parser.add_argument("--cell-max-length", type=float, default=0.052, help="Maximum rendered cell length.")
     parser.add_argument("--clip-low", type=float, default=-0.25, help="Low color clipping bound, e.g. -0.25.")
     parser.add_argument("--clip-high", type=float, default=0.55, help="High color clipping bound, e.g. 0.55.")
     parser.add_argument("--title", default="Belgium mortality tree", help="Chart title.")
@@ -47,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-note", default=None, help="Footer source note.")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="Output directory.")
     parser.add_argument("--name", default=None, help="Output filename stem.")
+    parser.add_argument("--png-dpi", type=int, default=420, help="Static PNG export resolution.")
     parser.add_argument("--fps", type=float, default=1.35, help="Animation frames per second.")
     parser.add_argument("--no-gif", action="store_true", help="Skip GIF export.")
     parser.add_argument("--no-mp4", action="store_true", help="Skip MP4 export.")
@@ -166,10 +168,42 @@ def smooth_boundary(boundary: np.ndarray, passes: int = 1) -> np.ndarray:
     return out
 
 
+def season_tint(theta: np.ndarray) -> np.ndarray:
+    anchors = np.array(
+        [
+            [0.00, *to_rgb("#6f9fa9")],
+            [0.17, *to_rgb("#aebd9d")],
+            [0.33, *to_rgb("#d6a15f")],
+            [0.50, *to_rgb("#d49b55")],
+            [0.67, *to_rgb("#bc755d")],
+            [0.83, *to_rgb("#8da0a1")],
+            [1.00, *to_rgb("#6f9fa9")],
+        ]
+    )
+    position = (theta % (2 * np.pi)) / (2 * np.pi)
+    return np.column_stack(
+        [
+            np.interp(position, anchors[:, 0], anchors[:, 1]),
+            np.interp(position, anchors[:, 0], anchors[:, 2]),
+            np.interp(position, anchors[:, 0], anchors[:, 3]),
+        ]
+    )
+
+
+def cell_colors(cells: pd.DataFrame, cmap: LinearSegmentedColormap, norm: TwoSlopeNorm) -> np.ndarray:
+    excess = cells["seasonal_excess_pct"].clip(norm.vmin, norm.vmax).fillna(0)
+    excess_rgb = cmap(norm(excess))[:, :3]
+    tint_rgb = season_tint(cells["theta"].to_numpy())
+    rgb = 0.58 * excess_rgb + 0.42 * tint_rgb
+    alpha = cells["alpha"].to_numpy() if "alpha" in cells else np.full(len(cells), 0.9)
+    return np.column_stack([np.clip(rgb, 0, 1), alpha])
+
+
 def simulate_cells(daily: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     rng = np.random.default_rng(args.seed)
     theta_grid = np.linspace(0, 2 * np.pi, 1440, endpoint=False)
-    boundary = 0.26 + 0.026 * smooth_noise(rng, len(theta_grid))
+    boundary = 0.035 + 0.012 * smooth_noise(rng, len(theta_grid))
+    cambium_bias = smooth_noise(rng, len(theta_grid), passes=38)
     rows: list[dict[str, float]] = []
 
     for year, year_days in daily.groupby("year", sort=True):
@@ -183,14 +217,17 @@ def simulate_cells(daily: pd.DataFrame, args: argparse.Namespace) -> pd.DataFram
             for _ in range(count):
                 theta = (record.theta_center + rng.normal(0, day_width * 2.1)) % (2 * np.pi)
                 index = int(theta / (2 * np.pi) * len(theta_grid)) % len(theta_grid)
-                radius = boundary[index] + rng.normal(0, 0.013) - rng.uniform(0.0, 0.028)
+                radius = boundary[index] + rng.normal(0, 0.014) - rng.uniform(0.0, 0.04)
+                radius = max(0.002, radius)
                 x, y = polar_to_xy(np.array([theta]), np.array([radius]))
+                ink_strength = float(np.clip((radius / 0.92) ** 0.9, 0.035, 1.0))
+                radial_scale = 0.18 + 0.82 * (ink_strength**0.65)
 
                 tangent = np.array([np.cos(theta), -np.sin(theta)])
                 normal = np.array([np.sin(theta), np.cos(theta)])
                 direction = tangent * rng.normal(1.0, 0.08) + normal * rng.normal(0.0, 0.22)
                 direction = direction / np.linalg.norm(direction)
-                length = rng.uniform(args.cell_min_length, args.cell_max_length)
+                length = rng.uniform(args.cell_min_length, args.cell_max_length) * radial_scale
 
                 rows.append(
                     {
@@ -199,18 +236,26 @@ def simulate_cells(daily: pd.DataFrame, args: argparse.Namespace) -> pd.DataFram
                         "y1": y[0] - direction[1] * length / 2,
                         "x2": x[0] + direction[0] * length / 2,
                         "y2": y[0] + direction[1] * length / 2,
+                        "theta": theta,
                         "seasonal_excess_pct": record.seasonal_excess_pct,
-                        "line_width": rng.uniform(0.34, 0.72),
+                        "line_width": rng.uniform(0.42, 1.02) * radial_scale,
+                        "alpha": 0.04 + 0.54 * ink_strength,
                     }
                 )
 
-                spread = 0.026 + 0.016 * rng.random()
-                growth = args.cell_growth * rng.uniform(0.55, 1.35)
+                spread = 0.024 + 0.026 * rng.random()
+                local_bias = 0.72 + 0.68 * (cambium_bias[index] + 1) / 2
+                growth = args.cell_growth * local_bias * rng.uniform(0.55, 1.35)
                 distance = angular_distance(theta_grid, theta)
                 boundary += growth * np.exp(-0.5 * (distance / spread) ** 2)
 
-        boundary = smooth_boundary(boundary, passes=5)
-        boundary += args.ring_rest + 0.014 * smooth_noise(rng, len(theta_grid), passes=24)
+        boundary = smooth_boundary(boundary, passes=3)
+        cambium_bias = smooth_boundary(0.72 * cambium_bias + 0.28 * smooth_noise(rng, len(theta_grid), passes=34), passes=2)
+        rest_profile = 0.2 + 1.2 * (cambium_bias + 1) / 2
+        boundary += args.ring_rest * rest_profile + 0.012 * smooth_noise(rng, len(theta_grid), passes=24)
+        if year % 5 == 0:
+            gap_profile = 0.82 + 0.36 * (cambium_bias + 1) / 2
+            boundary += args.five_year_gap * gap_profile
 
     return pd.DataFrame(rows)
 
@@ -265,7 +310,7 @@ def draw_frame(
     ax.clear()
     visible = cells[cells["year"] <= year]
     if not visible.empty:
-        colors = cmap(norm(visible["seasonal_excess_pct"].clip(norm.vmin, norm.vmax).fillna(0)))
+        colors = cell_colors(visible, cmap, norm)
         segments = visible[["x1", "y1", "x2", "y2"]].to_numpy().reshape(-1, 2, 2)
         ax.add_collection(
             LineCollection(
@@ -329,7 +374,7 @@ def render(args: argparse.Namespace) -> list[Path]:
 
     update(len(years) - 1)
     png_path = args.output_dir / f"{stem}.png"
-    fig.savefig(png_path, dpi=180)
+    fig.savefig(png_path, dpi=args.png_dpi)
     outputs.append(png_path)
 
     if not args.no_gif:

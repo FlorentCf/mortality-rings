@@ -2,7 +2,7 @@
 
 Create dendrochronology-inspired mortality charts and animations from daily death counts.
 
-The default example downloads Statbel's Belgian open-data file and turns daily deaths into a simulated tree section. Years grow from the center outward. Time of year bends around the trunk. Deaths are rendered as small deposited cells: by default, each cell represents about 85 deaths.
+The default example downloads Statbel's Belgian open-data file and turns daily deaths into a simulated tree section. Years grow from the center outward. Time of year bends around the trunk. Deaths are rendered as small deposited cells: by default, each cell represents about 45 deaths.
 
 The design is inspired by Pedro Cruz's [Simulated Dendrochronology](https://pmcruz.com/dendrochronology/) and the team's VISAP paper, [Process of simulating tree rings for immigration in the U.S.](https://pmcruz.com/download/portfolio-camera-ready.pdf). Cells are deposited near the evolving bark, then local growth pushes the outline outward. For Belgium mortality, the trunk quietly records seasonality, COVID waves, and heat-wave periods as density, color, and shape.
 
@@ -57,9 +57,9 @@ For European day-first dates, add `--dayfirst`.
 
 Cells are sampled from daily deaths and deposited near the current outer edge of the trunk. Their angle follows the day of year, with enough jitter to avoid visible bins. More deaths means more cells and more local outward growth.
 
-Color shows seasonal excess. The tool first learns a baseline seasonal profile from the selected reference years, then scales that profile to each year's total deaths. This keeps the cell count tied to raw mortality volume while using color to identify unusual weeks within the year's own seasonal rhythm.
+Color blends season and seasonal excess. The tool first learns a baseline seasonal profile from the selected reference years, then scales that profile to each year's total deaths. This keeps the cell count tied to raw mortality volume while letting nearby directions share a related tone and still identify unusual weeks within the year's own seasonal rhythm.
 
-The output intentionally avoids visible axes, gridded sectors, and rectangular containers. The months and years are encoded through the growth process itself: older cells remain closer to the pith, newer cells grow toward the bark, and seasonal time bends around the trunk.
+The output intentionally avoids visible axes, gridded sectors, and rectangular containers. The months and years are encoded through the growth process itself: older cells remain closer to the pith, newer cells grow toward the bark, seasonal time bends around the trunk, and pale five-year resting bands give the structure room to breathe.
 
 ## Useful Options
 
@@ -74,8 +74,9 @@ Common settings:
 - `--clip-low` and `--clip-high`: color-scale clipping bounds as proportions.
 - `--people-per-cell`: deaths represented by one cell.
 - `--seed`: deterministic cell placement seed.
-- `--cell-growth` and `--ring-rest`: organic growth styling.
+- `--cell-growth`, `--ring-rest`, and `--five-year-gap`: organic growth and resting-band styling.
 - `--cell-min-length` and `--cell-max-length`: rendered dash-cell size.
+- `--png-dpi`: high-resolution static PNG export.
 - `--no-gif` or `--no-mp4`: skip animation formats.
 - `--fps`: animation frame rate.
 - `--title` and `--subtitle`: visible chart text.
