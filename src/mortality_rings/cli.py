@@ -15,10 +15,15 @@ from matplotlib.colors import Colormap, LinearSegmentedColormap, TwoSlopeNorm, t
 
 try:
     from mortality_rings.v2 import render_v2_views, simulate_v2_cells
-    from mortality_rings.v3 import render_v3_views, simulate_v3_cells
+    from mortality_rings.v3 import (
+        render_v3_debug_fields,
+        render_v3_preset_sweep,
+        render_v3_views,
+        simulate_v3_cells,
+    )
 except ModuleNotFoundError:  # Allows direct execution as python src\mortality_rings\cli.py
     from v2 import render_v2_views, simulate_v2_cells
-    from v3 import render_v3_views, simulate_v3_cells
+    from v3 import render_v3_debug_fields, render_v3_preset_sweep, render_v3_views, simulate_v3_cells
 
 
 STATBEL_URL = "https://statbel.fgov.be/sites/default/files/files/opendata/bevolking/TF_DEATHS.zip"
@@ -51,15 +56,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-low", type=float, default=-0.18, help="Low color clipping bound, e.g. -0.18.")
     parser.add_argument("--clip-high", type=float, default=0.40, help="High color clipping bound, e.g. 0.40.")
     parser.add_argument("--colormap", default="wood-blood", help="V1 Matplotlib colormap for seasonal excess.")
-    parser.add_argument("--renderer", choices=["v1", "v2", "v3", "both", "all"], default="both", help="Renderer to run.")
+    parser.add_argument("--renderer", choices=["v1", "v2", "v3", "both", "all"], default="v3", help="Renderer to run.")
     parser.add_argument("--v2-views", choices=["art", "analytical", "both"], default="both", help="V2 views to render.")
     parser.add_argument("--v2-cell-radius", type=float, default=0.0038, help="V2 deposited-cell collision radius.")
     parser.add_argument("--v2-relax-iterations", type=int, default=72, help="V2 relaxation iterations per year.")
     parser.add_argument("--v2-outward-strength", type=float, default=0.016, help="V2 weak outward growth force.")
     parser.add_argument("--v3-views", choices=["art", "analytical", "both"], default="both", help="V3 views to render.")
-    parser.add_argument("--v3-people-per-cell", type=float, default=100, help="Deaths represented by one V3 cambium cell.")
-    parser.add_argument("--v3-cell-radius", type=float, default=0.0062, help="V3 deposited-cell collision radius.")
+    parser.add_argument("--v3-people-per-cell", type=float, default=220, help="Deaths represented by one V3 cambium cell.")
+    parser.add_argument("--v3-cell-radius", type=float, default=0.0072, help="V3 deposited-cell collision radius.")
     parser.add_argument("--v3-relax-iterations", type=int, default=60, help="V3 relaxation iterations per year.")
+    parser.add_argument("--v3-debug-fields", action="store_true", help="Write V3 debug field images beside the main render.")
+    parser.add_argument(
+        "--v3-preset-sweep",
+        choices=["scar-gap-texture"],
+        default=None,
+        help="Render a V3 contact sheet for a fixed preset sweep.",
+    )
     parser.add_argument("--title", default="Belgium mortality tree", help="Chart title.")
     parser.add_argument("--subtitle", default=None, help="Chart subtitle.")
     parser.add_argument("--source-note", default=None, help="Footer source note.")
@@ -184,10 +196,31 @@ def build_weekly_data(
     weekly["deficit_deaths"] = (-weekly["absolute_excess_deaths"]).clip(lower=0)
     weekly["absolute_excess_pct"] = weekly["absolute_excess_deaths"] / weekly["expected_abs_deaths"]
 
+    baseline_residuals = weekly.query("@baseline_start <= year <= @baseline_end").copy()
+    weekly_sigma = []
+    for week, group in baseline_residuals.groupby("week", sort=True):
+        residual = group["absolute_excess_deaths"].dropna().to_numpy(dtype=float)
+        if len(residual) == 0:
+            sigma = 0.0
+        else:
+            center = float(np.nanmedian(residual))
+            sigma = 1.4826 * float(np.nanmedian(np.abs(residual - center)))
+        weekly_sigma.append({"week": int(week), "weekly_mad_sigma": sigma if np.isfinite(sigma) else 0.0})
+    weekly = weekly.merge(pd.DataFrame(weekly_sigma), on="week", how="left")
+    weekly["weekly_mad_sigma"] = weekly["weekly_mad_sigma"].fillna(0)
+    weekly["acute_threshold_deaths"] = np.maximum(
+        1.5 * weekly["weekly_mad_sigma"],
+        0.10 * weekly["expected_abs_deaths"],
+    )
+    weekly["acute_excess_deaths"] = (
+        weekly["absolute_excess_deaths"] - weekly["acute_threshold_deaths"]
+    ).clip(lower=0)
+    weekly["acute_excess_pct"] = weekly["acute_excess_deaths"] / weekly["expected_abs_deaths"]
+
     weekly["expected_deaths"] = weekly["expected_share_deaths"]
     weekly["seasonal_excess_pct"] = weekly["seasonal_concentration_pct"]
     weekly["deaths"] = weekly["deaths"].fillna(0)
-    for column in ["seasonal_concentration_pct", "seasonal_excess_pct", "absolute_excess_pct"]:
+    for column in ["seasonal_concentration_pct", "seasonal_excess_pct", "absolute_excess_pct", "acute_excess_pct"]:
         weekly[column] = weekly[column].replace([np.inf, -np.inf], np.nan)
     return weekly
 
@@ -514,6 +547,28 @@ def render(args: argparse.Namespace) -> list[Path]:
                 views=selected_v3_views(args),
             )
         )
+        if args.v3_debug_fields:
+            outputs.extend(
+                render_v3_debug_fields(
+                    simulation=simulation,
+                    annual_totals=annual_totals,
+                    first_year=first_year,
+                    last_year=last_year,
+                    args=args,
+                    stem=stem,
+                )
+            )
+        if args.v3_preset_sweep:
+            outputs.extend(
+                render_v3_preset_sweep(
+                    weekly=weekly,
+                    annual_totals=annual_totals,
+                    first_year=first_year,
+                    last_year=last_year,
+                    args=args,
+                    stem=stem,
+                )
+            )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     summary_path = args.output_dir / "weekly_mortality_summary.csv"
