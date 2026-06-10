@@ -2,13 +2,16 @@
 
 Create dendrochronology-inspired mortality charts and animations from daily death counts.
 
-The default example downloads Statbel's Belgian open-data file and turns daily deaths into a simulated tree section. Years grow from the center outward. Time of year bends around the trunk. Deaths are rendered as small deposited cells: by default, each cell represents about 25 deaths.
+The Belgian example downloads Statbel's open-data file and turns daily deaths into simulated tree sections. The current default writes both renderers:
 
-The design is inspired by Pedro Cruz's [Simulated Dendrochronology](https://pmcruz.com/dendrochronology/) and the team's VISAP paper, [Process of simulating tree rings for immigration in the U.S.](https://pmcruz.com/download/portfolio-camera-ready.pdf). Cells are deposited near the evolving bark, then local growth pushes the outline outward. For Belgium mortality, the trunk quietly records seasonality, COVID waves, and heat-wave periods as density, color, and shape.
+- `v1`: the older polar/radial cell renderer, kept as a comparison baseline.
+- `v2`: a Cruz-inspired cambium simulation where weekly mortality deposits colored cells below the bark, packs them without visible overlap, and renders both an art view and an analytical view.
 
-![Belgium mortality tree](examples/belgium_mortality_tree_1992_2025.png)
+The design is inspired by Pedro Cruz's [Simulated Dendrochronology](https://pmcruz.com/dendrochronology/) and the VISAP paper, [Process of simulating tree rings for immigration in the U.S.](https://pmcruz.com/download/portfolio-camera-ready.pdf). This project adapts the principles to Belgian mortality seasonality rather than cloning the immigration visualization.
 
-Animated preview: [Belgium mortality tree GIF](examples/belgium_mortality_tree_1992_2025.gif)
+![Belgium mortality tree, v2 art](examples/belgium_mortality_tree_1992_2025_v2_art.png)
+
+Animated preview: [Belgium mortality tree v2 art GIF](examples/belgium_mortality_tree_1992_2025_v2_art.gif)
 
 ## Install
 
@@ -28,12 +31,18 @@ Generate the Belgian chart directly from Statbel:
 mortality-rings --statbel --output-dir outputs/belgium --name belgium_mortality_tree_1992_2025
 ```
 
-This writes:
+By default this writes:
 
-- `belgium_mortality_tree_1992_2025.png`
-- `belgium_mortality_tree_1992_2025.gif`
-- `belgium_mortality_tree_1992_2025.mp4`, when ffmpeg is installed
+- `belgium_mortality_tree_1992_2025_v1.png`
+- `belgium_mortality_tree_1992_2025_v1.gif`
+- `belgium_mortality_tree_1992_2025_v2_art.png`
+- `belgium_mortality_tree_1992_2025_v2_art.gif`
+- `belgium_mortality_tree_1992_2025_v2_analytical.png`
+- `belgium_mortality_tree_1992_2025_v2_analytical.gif`
+- matching `.mp4` files when ffmpeg is installed
 - `weekly_mortality_summary.csv`
+
+Use `--renderer v1`, `--renderer v2`, or `--renderer both` to choose the renderer. Use `--v2-views art`, `--v2-views analytical`, or `--v2-views both` for v2.
 
 ## Use Your Own Data
 
@@ -53,13 +62,19 @@ mortality-rings ^
 
 For European day-first dates, add `--dayfirst`.
 
-## Why This Encoding?
+## V2 Encoding
 
-Cells are sampled from daily deaths and deposited near the current outer edge of the trunk. Their angle follows the day of year, with enough jitter to avoid visible bins. More deaths means more cells and more local outward growth.
+V2 uses weekly mortality as the simulation grain. The tool learns a baseline seasonal profile from the reference years, scales that profile to each year's total deaths, and compares each observed week with its expected value.
 
-Color uses a high-contrast turbo scale for seasonal excess, with a very small seasonal tint to keep neighboring directions visually related. The tool first learns a baseline seasonal profile from the selected reference years, then scales that profile to each year's total deaths. This keeps the cell count tied to raw mortality volume while making unusual weeks easier to see.
+Expected mortality becomes colored seasonal tissue rather than grey filler: winter and early-year weeks lean cool blue, spring/summer weeks move through teal and green, and late-year weeks warm toward ochre and rust. Excess mortality pushes those cells toward ochre, dried red, and burgundy. Deficit periods are represented mostly by lower density; the analytical view also marks some deficit cells in muted blue-green.
 
-The output intentionally avoids visible axes, gridded sectors, and rectangular containers. The months and years are encoded through the growth process itself: older cells remain closer to the pith, newer cells grow toward the bark, seasonal time bends around the trunk, and thin pale five-year resting bands give the structure room to breathe.
+Cells are not placed at exact calendar axes. Each week has a broad seasonal region around the trunk, and cells are sampled from probability fields. Event weeks use tighter angular distributions, so COVID waves, winter waves, and heat-wave periods form visible local clusters.
+
+New v2 cells are inserted below the current bark/cambium and packed into tight non-overlapping dash fields. A SciPy `cKDTree` neighbor search verifies the final collision tolerance. Thin pale annual channels trace bark growth, with every fifth year only slightly emphasized so the tree structure breathes without becoming a chart grid.
+
+## V1 Encoding
+
+V1 is the previous polar renderer. It samples cells from daily deaths, assigns day-of-year to an angle, and grows a smoothed radial boundary. It remains useful as a comparison baseline, but v2 is the preferred artistic direction.
 
 ## Useful Options
 
@@ -69,18 +84,20 @@ mortality-rings --help
 
 Common settings:
 
+- `--renderer`: `v1`, `v2`, or `both`; defaults to `both`.
+- `--v2-views`: `art`, `analytical`, or `both`; defaults to `both`.
 - `--baseline-start` and `--baseline-end`: reference years for seasonal medians.
 - `--first-year` and `--last-year`: visible year range.
-- `--clip-low` and `--clip-high`: color-scale clipping bounds as proportions.
-- `--colormap`: Matplotlib color scale for seasonal excess; defaults to `turbo`.
 - `--people-per-cell`: deaths represented by one cell.
 - `--seed`: deterministic cell placement seed.
-- `--cell-growth`, `--ring-rest`, and `--five-year-gap`: organic growth and resting-band styling.
-- `--cell-min-length` and `--cell-max-length`: rendered dash-cell size.
+- `--v2-cell-radius`: v2 deposited-cell collision size; smaller values create finer high-resolution dashes.
+- `--v2-relax-iterations` and `--v2-outward-strength`: legacy v2 tuning flags kept for experimentation.
+- `--colormap`: v1 color scale; defaults to `wood-blood`.
+- `--clip-low` and `--clip-high`: v1 color-scale clipping bounds as proportions.
 - `--png-dpi`: high-resolution static PNG export.
 - `--no-gif` or `--no-mp4`: skip animation formats.
 - `--fps`: animation frame rate.
-- `--title` and `--subtitle`: visible chart text.
+- `--title` and `--subtitle`: visible analytical chart text.
 
 ## Data Source
 

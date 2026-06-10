@@ -11,7 +11,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.collections import LineCollection
-from matplotlib.colors import Colormap, TwoSlopeNorm, to_rgb
+from matplotlib.colors import Colormap, LinearSegmentedColormap, TwoSlopeNorm, to_rgb
+
+try:
+    from mortality_rings.v2 import render_v2_views, simulate_v2_cells
+except ModuleNotFoundError:  # Allows direct execution as python src\mortality_rings\cli.py
+    from v2 import render_v2_views, simulate_v2_cells
 
 
 STATBEL_URL = "https://statbel.fgov.be/sites/default/files/files/opendata/bevolking/TF_DEATHS.zip"
@@ -43,7 +48,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cell-max-length", type=float, default=0.034, help="Maximum rendered cell length.")
     parser.add_argument("--clip-low", type=float, default=-0.18, help="Low color clipping bound, e.g. -0.18.")
     parser.add_argument("--clip-high", type=float, default=0.40, help="High color clipping bound, e.g. 0.40.")
-    parser.add_argument("--colormap", default="turbo", help="Matplotlib colormap for seasonal excess.")
+    parser.add_argument("--colormap", default="wood-blood", help="V1 Matplotlib colormap for seasonal excess.")
+    parser.add_argument("--renderer", choices=["v1", "v2", "both"], default="both", help="Renderer to run.")
+    parser.add_argument("--v2-views", choices=["art", "analytical", "both"], default="both", help="V2 views to render.")
+    parser.add_argument("--v2-cell-radius", type=float, default=0.0038, help="V2 deposited-cell collision radius.")
+    parser.add_argument("--v2-relax-iterations", type=int, default=72, help="V2 relaxation iterations per year.")
+    parser.add_argument("--v2-outward-strength", type=float, default=0.016, help="V2 weak outward growth force.")
     parser.add_argument("--title", default="Belgium mortality tree", help="Chart title.")
     parser.add_argument("--subtitle", default=None, help="Chart subtitle.")
     parser.add_argument("--source-note", default=None, help="Footer source note.")
@@ -264,7 +274,14 @@ def simulate_cells(daily: pd.DataFrame, args: argparse.Namespace) -> pd.DataFram
 
 
 def make_palette(args: argparse.Namespace) -> tuple[Colormap, TwoSlopeNorm]:
-    return plt.get_cmap(args.colormap), TwoSlopeNorm(vmin=args.clip_low, vcenter=0, vmax=args.clip_high)
+    if args.colormap == "wood-blood":
+        cmap = LinearSegmentedColormap.from_list(
+            "wood_blood_v1",
+            ["#376b72", "#b8afa0", "#d8c5a0", "#c58b33", "#a94f2d", "#421827"],
+        )
+    else:
+        cmap = plt.get_cmap(args.colormap)
+    return cmap, TwoSlopeNorm(vmin=args.clip_low, vcenter=0, vmax=args.clip_high)
 
 
 def add_figure_text(fig: plt.Figure, args: argparse.Namespace, first_year: int, last_year: int) -> None:
@@ -339,7 +356,7 @@ def draw_frame(
     ax.set_facecolor("#fbf7ef")
 
 
-def render(args: argparse.Namespace) -> list[Path]:
+def prepare_data(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, int, int]:
     all_daily = add_calendar_fields(load_daily_deaths(args))
     first_year = args.first_year or int(all_daily["year"].min())
     last_year = args.last_year or int(all_daily["year"].max())
@@ -349,11 +366,22 @@ def render(args: argparse.Namespace) -> list[Path]:
     weekly = build_weekly_data(weekly_source, context_start, context_end, args.baseline_start, args.baseline_end)
     daily = all_daily.query("@first_year <= year <= @last_year").copy()
     daily = attach_weekly_context(daily, weekly)
+    annual_totals = daily.groupby("year")["deaths"].sum().astype(int).loc[first_year:last_year]
+    return daily, weekly, annual_totals, first_year, last_year
+
+
+def render_v1(
+    daily: pd.DataFrame,
+    annual_totals: pd.Series,
+    first_year: int,
+    last_year: int,
+    args: argparse.Namespace,
+    stem: str,
+) -> list[Path]:
     cells = simulate_cells(daily, args)
     if cells.empty:
         raise ValueError("No cells were generated. Check the date range and people-per-cell value.")
 
-    annual_totals = daily.groupby("year")["deaths"].sum().astype(int).loc[first_year:last_year]
     years = sorted(annual_totals.index)
     max_extent = float(np.nanmax(np.abs(cells[["x1", "y1", "x2", "y2"]].to_numpy()))) * 1.11
 
@@ -369,28 +397,62 @@ def render(args: argparse.Namespace) -> list[Path]:
         draw_frame(ax, cells, max_extent, years[frame_index], cmap, norm, annual_totals)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    stem = args.name or f"mortality_tree_{first_year}_{last_year}"
     outputs = []
 
     update(len(years) - 1)
-    png_path = args.output_dir / f"{stem}.png"
+    png_path = args.output_dir / f"{stem}_v1.png"
     fig.savefig(png_path, dpi=args.png_dpi)
     outputs.append(png_path)
 
     if not args.no_gif:
         ani = animation.FuncAnimation(fig, update, frames=len(years), interval=720, repeat=True)
-        gif_path = args.output_dir / f"{stem}.gif"
+        gif_path = args.output_dir / f"{stem}_v1.gif"
         ani.save(gif_path, writer=animation.PillowWriter(fps=args.fps))
         outputs.append(gif_path)
     if not args.no_mp4:
         ani = animation.FuncAnimation(fig, update, frames=len(years), interval=720, repeat=True)
-        mp4_path = args.output_dir / f"{stem}.mp4"
+        mp4_path = args.output_dir / f"{stem}_v1.mp4"
         try:
             ani.save(mp4_path, writer=animation.FFMpegWriter(fps=args.fps, bitrate=2400))
             outputs.append(mp4_path)
         except Exception as exc:
             print(f"Skipping MP4 export because ffmpeg failed: {exc}")
 
+    plt.close(fig)
+    return outputs
+
+
+def selected_v2_views(args: argparse.Namespace) -> list[str]:
+    if args.v2_views == "both":
+        return ["art", "analytical"]
+    return [args.v2_views]
+
+
+def render(args: argparse.Namespace) -> list[Path]:
+    daily, weekly, annual_totals, first_year, last_year = prepare_data(args)
+    stem = args.name or f"mortality_tree_{first_year}_{last_year}"
+    outputs: list[Path] = []
+
+    if args.renderer in {"v1", "both"}:
+        outputs.extend(render_v1(daily, annual_totals, first_year, last_year, args, stem))
+
+    if args.renderer in {"v2", "both"}:
+        simulation = simulate_v2_cells(weekly, first_year, last_year, args)
+        if simulation.cells.empty:
+            raise ValueError("No V2 cells were generated. Check the date range and people-per-cell value.")
+        outputs.extend(
+            render_v2_views(
+                simulation=simulation,
+                annual_totals=annual_totals,
+                first_year=first_year,
+                last_year=last_year,
+                args=args,
+                stem=stem,
+                views=selected_v2_views(args),
+            )
+        )
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
     summary_path = args.output_dir / "weekly_mortality_summary.csv"
     weekly.to_csv(summary_path, index=False)
     outputs.append(summary_path)

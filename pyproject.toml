@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mortality-rings"
 version = "0.1.0"
-description = "Create radial mortality ring charts and animations from daily death counts."
+description = "Create dendrochronology-inspired mortality tree charts and animations from daily death counts."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -15,6 +15,7 @@ dependencies = [
   "numpy>=1.26",
   "pandas>=2.1",
   "pillow>=10",
+  "scipy>=1.11",
 ]
 
 [project.scripts]
