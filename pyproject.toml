@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mortality-rings"
+version = "0.1.0"
+description = "Create radial mortality ring charts and animations from daily death counts."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Florent Chif" }]
+dependencies = [
+  "matplotlib>=3.8",
+  "numpy>=1.26",
+  "pandas>=2.1",
+  "pillow>=10",
+]
+
+[project.scripts]
+mortality-rings = "mortality_rings.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
