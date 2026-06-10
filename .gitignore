@@ -10,4 +10,5 @@ build/
 *.egg-info/
 outputs/
 data/
+tmp/
 .DS_Store

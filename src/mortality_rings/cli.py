@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import tempfile
 import urllib.request
 import zipfile
@@ -11,8 +10,8 @@ import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.collections import LineCollection
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
-from matplotlib.patches import Patch
 
 
 STATBEL_URL = "https://statbel.fgov.be/sites/default/files/files/opendata/bevolking/TF_DEATHS.zip"
@@ -21,7 +20,7 @@ WEEKS_PER_YEAR = 52
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create radial mortality ring charts and animations from daily death counts."
+        description="Create dendrochronology-inspired mortality cell charts from daily death counts."
     )
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--statbel", action="store_true", help="Download Statbel's Belgian daily deaths file.")
@@ -35,14 +34,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--last-year", type=int, default=None, help="Last visible year. Defaults to data maximum.")
     parser.add_argument("--baseline-start", type=int, default=1992, help="First baseline year.")
     parser.add_argument("--baseline-end", type=int, default=2019, help="Last baseline year.")
+    parser.add_argument("--people-per-cell", type=float, default=85, help="Deaths represented by one deposited cell.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for deterministic cell deposition.")
+    parser.add_argument("--cell-growth", type=float, default=0.0057, help="How strongly each cell grows the bark.")
+    parser.add_argument("--ring-rest", type=float, default=0.045, help="Quiet gap added after each year's growth.")
+    parser.add_argument("--cell-min-length", type=float, default=0.014, help="Minimum rendered cell length.")
+    parser.add_argument("--cell-max-length", type=float, default=0.038, help="Maximum rendered cell length.")
     parser.add_argument("--clip-low", type=float, default=-0.25, help="Low color clipping bound, e.g. -0.25.")
-    parser.add_argument("--clip-high", type=float, default=0.75, help="High color clipping bound, e.g. 0.75.")
-    parser.add_argument("--title", default="Belgium mortality rings", help="Chart title.")
-    parser.add_argument(
-        "--subtitle",
-        default=None,
-        help="Chart subtitle. Defaults to a generated baseline description.",
-    )
+    parser.add_argument("--clip-high", type=float, default=0.55, help="High color clipping bound, e.g. 0.55.")
+    parser.add_argument("--title", default="Belgium mortality tree", help="Chart title.")
+    parser.add_argument("--subtitle", default=None, help="Chart subtitle.")
     parser.add_argument("--source-note", default=None, help="Footer source note.")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="Output directory.")
     parser.add_argument("--name", default=None, help="Output filename stem.")
@@ -94,6 +95,17 @@ def load_daily_deaths(args: argparse.Namespace) -> pd.DataFrame:
     return daily.sort_values("date")
 
 
+def add_calendar_fields(daily: pd.DataFrame) -> pd.DataFrame:
+    days_in_year = np.where(daily["date"].dt.is_leap_year, 366, 365)
+    out = daily.copy()
+    out["year"] = out["date"].dt.year.astype(int)
+    out["day_of_year"] = out["date"].dt.dayofyear.astype(int)
+    out["days_in_year"] = days_in_year
+    out["week"] = (((out["day_of_year"] - 1) * WEEKS_PER_YEAR) // days_in_year + 1).astype(int)
+    out["theta_center"] = 2 * np.pi * (out["day_of_year"] - 0.5) / days_in_year
+    return out
+
+
 def build_weekly_data(
     daily: pd.DataFrame,
     first_year: int,
@@ -101,173 +113,218 @@ def build_weekly_data(
     baseline_start: int,
     baseline_end: int,
 ) -> pd.DataFrame:
-    days_in_year = np.where(daily["date"].dt.is_leap_year, 366, 365)
     weekly = (
-        daily.assign(
-            year=daily["date"].dt.year.astype(int),
-            week=(((daily["date"].dt.dayofyear - 1) * WEEKS_PER_YEAR) // days_in_year + 1).astype(int),
-        )
-        .query("@first_year <= year <= @last_year")
+        daily.query("@first_year <= year <= @last_year")
         .groupby(["year", "week"], as_index=False)["deaths"]
         .sum()
     )
-
     full_index = pd.MultiIndex.from_product(
         [range(first_year, last_year + 1), range(1, WEEKS_PER_YEAR + 1)],
         names=["year", "week"],
     )
     weekly = weekly.set_index(["year", "week"]).reindex(full_index).reset_index()
-
     baseline = weekly.query("@baseline_start <= year <= @baseline_end")
     if baseline["deaths"].notna().sum() == 0:
         raise ValueError("Baseline has no data. Adjust --baseline-start/--baseline-end.")
 
     week_reference = baseline.groupby("week")["deaths"].median().rename("baseline_median").reset_index()
+    week_reference["baseline_share"] = week_reference["baseline_median"] / week_reference["baseline_median"].sum()
     weekly = weekly.merge(week_reference, on="week", how="left")
-    weekly["excess_pct"] = (weekly["deaths"] - weekly["baseline_median"]) / weekly["baseline_median"]
+    annual_totals = weekly.groupby("year")["deaths"].transform("sum")
+    weekly["expected_deaths"] = annual_totals * weekly["baseline_share"]
+    weekly["seasonal_excess_pct"] = (weekly["deaths"] - weekly["expected_deaths"]) / weekly["expected_deaths"]
     weekly["deaths"] = weekly["deaths"].fillna(0)
-    weekly["excess_pct"] = weekly["excess_pct"].replace([np.inf, -np.inf], np.nan)
+    weekly["seasonal_excess_pct"] = weekly["seasonal_excess_pct"].replace([np.inf, -np.inf], np.nan)
     return weekly
 
 
-def prepare_plot_data(weekly: pd.DataFrame) -> pd.DataFrame:
-    years = sorted(weekly["year"].unique())
-    year_to_ring = {year: i for i, year in enumerate(years)}
-    data = weekly.copy()
-    data["ring"] = data["year"].map(year_to_ring)
-    data["theta"] = 2 * np.pi * (data["week"] - 0.5) / WEEKS_PER_YEAR
-    data["width"] = 2 * np.pi / WEEKS_PER_YEAR * 0.94
-    return data
+def attach_weekly_context(daily: pd.DataFrame, weekly: pd.DataFrame) -> pd.DataFrame:
+    return daily.merge(weekly[["year", "week", "seasonal_excess_pct"]], on=["year", "week"], how="left")
+
+
+def polar_to_xy(theta: np.ndarray, radius: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    return radius * np.sin(theta), radius * np.cos(theta)
+
+
+def angular_distance(grid: np.ndarray, theta: float) -> np.ndarray:
+    return np.angle(np.exp(1j * (grid - theta)))
+
+
+def smooth_noise(rng: np.random.Generator, size: int, passes: int = 20) -> np.ndarray:
+    values = rng.normal(0, 1, size)
+    for _ in range(passes):
+        values = (np.roll(values, 1) + values + np.roll(values, -1)) / 3
+    values -= values.mean()
+    scale = np.max(np.abs(values))
+    return values / scale if scale else values
+
+
+def smooth_boundary(boundary: np.ndarray, passes: int = 1) -> np.ndarray:
+    out = boundary.copy()
+    for _ in range(passes):
+        out = np.roll(out, 1) * 0.24 + out * 0.52 + np.roll(out, -1) * 0.24
+    return out
+
+
+def simulate_cells(daily: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    rng = np.random.default_rng(args.seed)
+    theta_grid = np.linspace(0, 2 * np.pi, 1440, endpoint=False)
+    boundary = 0.26 + 0.026 * smooth_noise(rng, len(theta_grid))
+    rows: list[dict[str, float]] = []
+
+    for year, year_days in daily.groupby("year", sort=True):
+        events = year_days.sample(frac=1, random_state=int(rng.integers(0, 2**32 - 1)))
+        for record in events.itertuples(index=False):
+            if not np.isfinite(record.deaths) or record.deaths <= 0:
+                continue
+            count = max(1, int(np.floor(record.deaths / args.people_per_cell + rng.random())))
+            day_width = 2 * np.pi / record.days_in_year
+
+            for _ in range(count):
+                theta = (record.theta_center + rng.normal(0, day_width * 2.1)) % (2 * np.pi)
+                index = int(theta / (2 * np.pi) * len(theta_grid)) % len(theta_grid)
+                radius = boundary[index] + rng.normal(0, 0.013) - rng.uniform(0.0, 0.028)
+                x, y = polar_to_xy(np.array([theta]), np.array([radius]))
+
+                tangent = np.array([np.cos(theta), -np.sin(theta)])
+                normal = np.array([np.sin(theta), np.cos(theta)])
+                direction = tangent * rng.normal(1.0, 0.08) + normal * rng.normal(0.0, 0.22)
+                direction = direction / np.linalg.norm(direction)
+                length = rng.uniform(args.cell_min_length, args.cell_max_length)
+
+                rows.append(
+                    {
+                        "year": year,
+                        "x1": x[0] - direction[0] * length / 2,
+                        "y1": y[0] - direction[1] * length / 2,
+                        "x2": x[0] + direction[0] * length / 2,
+                        "y2": y[0] + direction[1] * length / 2,
+                        "seasonal_excess_pct": record.seasonal_excess_pct,
+                        "line_width": rng.uniform(0.34, 0.72),
+                    }
+                )
+
+                spread = 0.026 + 0.016 * rng.random()
+                growth = args.cell_growth * rng.uniform(0.55, 1.35)
+                distance = angular_distance(theta_grid, theta)
+                boundary += growth * np.exp(-0.5 * (distance / spread) ** 2)
+
+        boundary = smooth_boundary(boundary, passes=5)
+        boundary += args.ring_rest + 0.014 * smooth_noise(rng, len(theta_grid), passes=24)
+
+    return pd.DataFrame(rows)
 
 
 def make_palette() -> tuple[LinearSegmentedColormap, TwoSlopeNorm]:
     cmap = LinearSegmentedColormap.from_list(
-        "mortality_balance",
-        ["#24476f", "#70a7c8", "#f7f0df", "#e39a5d", "#8f1d2c", "#361020"],
+        "mortality_cells",
+        ["#16344b", "#6f9fa9", "#eadabb", "#cc8244", "#a62a3a", "#2d101d"],
     )
-    return cmap, TwoSlopeNorm(vmin=-0.25, vcenter=0, vmax=0.75)
+    return cmap, TwoSlopeNorm(vmin=-0.25, vcenter=0, vmax=0.55)
 
 
 def add_figure_text(fig: plt.Figure, args: argparse.Namespace, first_year: int, last_year: int) -> None:
     subtitle = args.subtitle or (
-        f"Weekly deaths by calendar year, colored versus the "
-        f"{args.baseline_start}-{args.baseline_end} median for the same week"
+        f"Belgian deaths, {first_year}-{last_year}: one deposited cell is about {args.people_per_cell:g} deaths"
     )
-    note = args.source_note or (
-        f"Source: Statbel open data, Number of deaths per day, {first_year}-{last_year}. "
-        f"Color scale is clipped at {args.clip_low:.0%} and {args.clip_high:.0%} "
-        "so ordinary seasonal variation remains visible."
+    note = args.source_note or f"Source: Statbel open data, Number of deaths per day, {first_year}-{last_year}."
+    method = (
+        f"Cells grow near the bark; angle follows day of year; color compares weeks with a "
+        f"{args.baseline_start}-{args.baseline_end} seasonal profile."
     )
-    fig.text(0.5, 0.962, args.title, ha="center", va="center", fontsize=30, fontweight="bold", color="#1f2933")
-    fig.text(0.5, 0.925, subtitle, ha="center", va="center", fontsize=13, color="#59616e")
-    fig.text(0.5, 0.045, note, ha="center", va="center", fontsize=9.5, color="#59616e")
+    fig.text(0.5, 0.962, args.title, ha="center", va="center", fontsize=30, fontweight="bold", color="#201f1b")
+    fig.text(0.5, 0.928, subtitle, ha="center", va="center", fontsize=12.5, color="#635f56")
+    fig.text(0.5, 0.047, note, ha="center", va="center", fontsize=9.3, color="#635f56")
+    fig.text(0.5, 0.029, method, ha="center", va="center", fontsize=8.7, color="#756f64")
 
 
-def add_legend(fig: plt.Figure, cmap: LinearSegmentedColormap, norm: TwoSlopeNorm) -> None:
-    legend_ax = fig.add_axes([0.31, 0.077, 0.38, 0.018])
+def add_colorbar(fig: plt.Figure, cmap: LinearSegmentedColormap, norm: TwoSlopeNorm) -> None:
+    legend_ax = fig.add_axes([0.31, 0.083, 0.38, 0.018])
     gradient = np.linspace(norm.vmin, norm.vmax, 256).reshape(1, -1)
     legend_ax.imshow(gradient, aspect="auto", cmap=cmap, norm=norm)
     legend_ax.set_yticks([])
     legend_ax.set_xticks([0, 64, 128, 192, 255])
-    legend_ax.set_xticklabels([f"{norm.vmin:.0%}", "lower", "baseline", "higher", f"{norm.vmax:.0%}+"], fontsize=8, color="#59616e")
+    legend_ax.set_xticklabels(
+        [f"{norm.vmin:.0%}", "lower", "expected", "higher", f"{norm.vmax:.0%}+"],
+        fontsize=8,
+        color="#635f56",
+    )
     for spine in legend_ax.spines.values():
         spine.set_visible(False)
-    fig.legend(
-        handles=[Patch(facecolor="#8f1d2c", label="Extreme high weeks are intentionally saturated")],
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.103),
-        frameon=False,
-        fontsize=9,
-        labelcolor="#59616e",
-    )
 
 
 def draw_frame(
     ax: plt.Axes,
-    data: pd.DataFrame,
+    cells: pd.DataFrame,
+    max_extent: float,
     year: int,
     cmap: LinearSegmentedColormap,
     norm: TwoSlopeNorm,
     annual_totals: pd.Series,
 ) -> None:
     ax.clear()
-    visible = data[data["year"] <= year].copy()
-    colors = cmap(norm(visible["excess_pct"].clip(norm.vmin, norm.vmax).fillna(0)))
-    colors[visible["deaths"].eq(0).to_numpy()] = (0.88, 0.88, 0.86, 0.18)
-
-    ax.bar(
-        visible["theta"],
-        np.full(len(visible), 0.86),
-        width=visible["width"],
-        bottom=visible["ring"] + 1.3,
-        color=colors,
-        edgecolor="#f7f2e8",
-        linewidth=0.24,
-        align="center",
-    )
-
-    years = sorted(data["year"].unique())
-    outer_radius = len(years) + 3.1
-    for theta, label in zip(
-        np.linspace(0, 2 * np.pi, 12, endpoint=False),
-        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
-    ):
-        ax.text(theta, outer_radius, label, ha="center", va="center", fontsize=11, color="#3f4652")
-
-    for label_year in [years[0], 2000, 2010, 2020, years[-1]]:
-        if label_year <= year and label_year in years:
-            ring = data.loc[data["year"].eq(label_year), "ring"].iloc[0] + 1.73
-            ax.text(math.radians(356), ring, str(label_year), ha="right", va="center", fontsize=8, color="#374151")
-
-    ax.set_xticks([])
-    ax.set_yticklabels([])
-    ax.set_ylim(0, len(years) + 4.4)
-    ax.set_theta_direction(-1)
-    ax.set_theta_offset(np.pi / 2)
-    ax.grid(False)
-    ax.spines["polar"].set_visible(False)
-    ax.set_facecolor("#fbfaf6")
+    visible = cells[cells["year"] <= year]
+    if not visible.empty:
+        colors = cmap(norm(visible["seasonal_excess_pct"].clip(norm.vmin, norm.vmax).fillna(0)))
+        segments = visible[["x1", "y1", "x2", "y2"]].to_numpy().reshape(-1, 2, 2)
+        ax.add_collection(
+            LineCollection(
+                segments,
+                colors=colors,
+                linewidths=visible["line_width"].to_numpy(),
+                alpha=0.88,
+                capstyle="round",
+            )
+        )
 
     latest_total = int(annual_totals.loc[year])
     ax.text(
-        0.5,
-        0.5,
-        f"{year}\n{latest_total:,}\ndeaths",
-        transform=ax.transAxes,
-        ha="center",
+        -max_extent * 0.92,
+        -max_extent * 0.94,
+        f"{year}  |  {latest_total:,} deaths",
+        ha="left",
         va="center",
-        fontsize=22,
-        color="#222831",
-        fontweight="bold",
-        linespacing=1.18,
+        fontsize=11,
+        color="#5b554b",
     )
+
+    ax.set_xlim(-max_extent, max_extent)
+    ax.set_ylim(-max_extent, max_extent)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_facecolor("#fbf7ef")
 
 
 def render(args: argparse.Namespace) -> list[Path]:
-    daily = load_daily_deaths(args)
-    first_year = args.first_year or int(daily["date"].dt.year.min())
-    last_year = args.last_year or int(daily["date"].dt.year.max())
+    daily = add_calendar_fields(load_daily_deaths(args))
+    first_year = args.first_year or int(daily["year"].min())
+    last_year = args.last_year or int(daily["year"].max())
+    daily = daily.query("@first_year <= year <= @last_year").copy()
     weekly = build_weekly_data(daily, first_year, last_year, args.baseline_start, args.baseline_end)
-    data = prepare_plot_data(weekly)
-    annual_totals = daily.groupby(daily["date"].dt.year)["deaths"].sum().astype(int)
-    annual_totals = annual_totals.loc[first_year:last_year]
-    years = sorted(data["year"].unique())
+    daily = attach_weekly_context(daily, weekly)
+    cells = simulate_cells(daily, args)
+    if cells.empty:
+        raise ValueError("No cells were generated. Check the date range and people-per-cell value.")
+
+    annual_totals = daily.groupby("year")["deaths"].sum().astype(int).loc[first_year:last_year]
+    years = sorted(annual_totals.index)
+    max_extent = float(np.nanmax(np.abs(cells[["x1", "y1", "x2", "y2"]].to_numpy()))) * 1.11
 
     cmap, norm = make_palette()
     norm.vmin = args.clip_low
     norm.vmax = args.clip_high
 
-    plt.rcParams.update({"font.family": "DejaVu Sans", "figure.facecolor": "#fbfaf6", "savefig.facecolor": "#fbfaf6"})
-    fig, ax = plt.subplots(figsize=(10.8, 10.8), dpi=150, subplot_kw={"projection": "polar"})
-    fig.subplots_adjust(left=0.065, right=0.935, top=0.845, bottom=0.18)
+    plt.rcParams.update({"font.family": "DejaVu Sans", "figure.facecolor": "#fbf7ef", "savefig.facecolor": "#fbf7ef"})
+    fig, ax = plt.subplots(figsize=(10.8, 10.8), dpi=150)
+    fig.subplots_adjust(left=0.055, right=0.945, top=0.875, bottom=0.155)
     add_figure_text(fig, args, first_year, last_year)
-    add_legend(fig, cmap, norm)
+    add_colorbar(fig, cmap, norm)
 
     def update(frame_index: int) -> None:
-        draw_frame(ax, data, years[frame_index], cmap, norm, annual_totals)
+        draw_frame(ax, cells, max_extent, years[frame_index], cmap, norm, annual_totals)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    stem = args.name or f"mortality_rings_{first_year}_{last_year}"
+    stem = args.name or f"mortality_tree_{first_year}_{last_year}"
     outputs = []
 
     update(len(years) - 1)
