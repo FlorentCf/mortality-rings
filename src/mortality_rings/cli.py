@@ -15,8 +15,10 @@ from matplotlib.colors import Colormap, LinearSegmentedColormap, TwoSlopeNorm, t
 
 try:
     from mortality_rings.v2 import render_v2_views, simulate_v2_cells
+    from mortality_rings.v3 import render_v3_views, simulate_v3_cells
 except ModuleNotFoundError:  # Allows direct execution as python src\mortality_rings\cli.py
     from v2 import render_v2_views, simulate_v2_cells
+    from v3 import render_v3_views, simulate_v3_cells
 
 
 STATBEL_URL = "https://statbel.fgov.be/sites/default/files/files/opendata/bevolking/TF_DEATHS.zip"
@@ -49,11 +51,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-low", type=float, default=-0.18, help="Low color clipping bound, e.g. -0.18.")
     parser.add_argument("--clip-high", type=float, default=0.40, help="High color clipping bound, e.g. 0.40.")
     parser.add_argument("--colormap", default="wood-blood", help="V1 Matplotlib colormap for seasonal excess.")
-    parser.add_argument("--renderer", choices=["v1", "v2", "both"], default="both", help="Renderer to run.")
+    parser.add_argument("--renderer", choices=["v1", "v2", "v3", "both", "all"], default="both", help="Renderer to run.")
     parser.add_argument("--v2-views", choices=["art", "analytical", "both"], default="both", help="V2 views to render.")
     parser.add_argument("--v2-cell-radius", type=float, default=0.0038, help="V2 deposited-cell collision radius.")
     parser.add_argument("--v2-relax-iterations", type=int, default=72, help="V2 relaxation iterations per year.")
     parser.add_argument("--v2-outward-strength", type=float, default=0.016, help="V2 weak outward growth force.")
+    parser.add_argument("--v3-views", choices=["art", "analytical", "both"], default="both", help="V3 views to render.")
+    parser.add_argument("--v3-people-per-cell", type=float, default=100, help="Deaths represented by one V3 cambium cell.")
+    parser.add_argument("--v3-cell-radius", type=float, default=0.0062, help="V3 deposited-cell collision radius.")
+    parser.add_argument("--v3-relax-iterations", type=int, default=60, help="V3 relaxation iterations per year.")
     parser.add_argument("--title", default="Belgium mortality tree", help="Chart title.")
     parser.add_argument("--subtitle", default=None, help="Chart subtitle.")
     parser.add_argument("--source-note", default=None, help="Footer source note.")
@@ -144,10 +150,45 @@ def build_weekly_data(
     week_reference["baseline_share"] = week_reference["baseline_median"] / week_reference["baseline_median"].sum()
     weekly = weekly.merge(week_reference, on="week", how="left")
     annual_totals = weekly.groupby("year")["deaths"].transform("sum")
-    weekly["expected_deaths"] = annual_totals * weekly["baseline_share"]
-    weekly["seasonal_excess_pct"] = (weekly["deaths"] - weekly["expected_deaths"]) / weekly["expected_deaths"]
+    weekly["expected_share_deaths"] = annual_totals * weekly["baseline_share"]
+    weekly["seasonal_concentration_pct"] = (
+        weekly["deaths"] - weekly["expected_share_deaths"]
+    ) / weekly["expected_share_deaths"]
+
+    baseline_annual = (
+        weekly.query("@baseline_start <= year <= @baseline_end")
+        .groupby("year", as_index=False)["deaths"]
+        .sum()
+        .dropna()
+    )
+    years = baseline_annual["year"].to_numpy(dtype=float)
+    totals = baseline_annual["deaths"].to_numpy(dtype=float)
+    if len(baseline_annual) >= 2:
+        deltas_x = years[:, None] - years[None, :]
+        deltas_y = totals[:, None] - totals[None, :]
+        upper = deltas_x > 0
+        slope = float(np.median(deltas_y[upper] / deltas_x[upper]))
+        intercept = float(np.median(totals - slope * years))
+    else:
+        slope = 0.0
+        intercept = float(totals[0])
+
+    annual_expected = weekly[["year"]].drop_duplicates().copy()
+    annual_expected["expected_annual_deaths"] = intercept + slope * annual_expected["year"]
+    floor = max(float(np.nanmedian(totals)) * 0.35, 1.0)
+    annual_expected["expected_annual_deaths"] = annual_expected["expected_annual_deaths"].clip(lower=floor)
+    weekly = weekly.merge(annual_expected, on="year", how="left")
+    weekly["expected_abs_deaths"] = weekly["expected_annual_deaths"] * weekly["baseline_share"]
+    weekly["absolute_excess_deaths"] = weekly["deaths"] - weekly["expected_abs_deaths"]
+    weekly["positive_excess_deaths"] = weekly["absolute_excess_deaths"].clip(lower=0)
+    weekly["deficit_deaths"] = (-weekly["absolute_excess_deaths"]).clip(lower=0)
+    weekly["absolute_excess_pct"] = weekly["absolute_excess_deaths"] / weekly["expected_abs_deaths"]
+
+    weekly["expected_deaths"] = weekly["expected_share_deaths"]
+    weekly["seasonal_excess_pct"] = weekly["seasonal_concentration_pct"]
     weekly["deaths"] = weekly["deaths"].fillna(0)
-    weekly["seasonal_excess_pct"] = weekly["seasonal_excess_pct"].replace([np.inf, -np.inf], np.nan)
+    for column in ["seasonal_concentration_pct", "seasonal_excess_pct", "absolute_excess_pct"]:
+        weekly[column] = weekly[column].replace([np.inf, -np.inf], np.nan)
     return weekly
 
 
@@ -428,15 +469,21 @@ def selected_v2_views(args: argparse.Namespace) -> list[str]:
     return [args.v2_views]
 
 
+def selected_v3_views(args: argparse.Namespace) -> list[str]:
+    if args.v3_views == "both":
+        return ["art", "analytical"]
+    return [args.v3_views]
+
+
 def render(args: argparse.Namespace) -> list[Path]:
     daily, weekly, annual_totals, first_year, last_year = prepare_data(args)
     stem = args.name or f"mortality_tree_{first_year}_{last_year}"
     outputs: list[Path] = []
 
-    if args.renderer in {"v1", "both"}:
+    if args.renderer in {"v1", "both", "all"}:
         outputs.extend(render_v1(daily, annual_totals, first_year, last_year, args, stem))
 
-    if args.renderer in {"v2", "both"}:
+    if args.renderer in {"v2", "both", "all"}:
         simulation = simulate_v2_cells(weekly, first_year, last_year, args)
         if simulation.cells.empty:
             raise ValueError("No V2 cells were generated. Check the date range and people-per-cell value.")
@@ -449,6 +496,22 @@ def render(args: argparse.Namespace) -> list[Path]:
                 args=args,
                 stem=stem,
                 views=selected_v2_views(args),
+            )
+        )
+
+    if args.renderer in {"v3", "all"}:
+        simulation = simulate_v3_cells(weekly, first_year, last_year, args)
+        if simulation.cells.empty:
+            raise ValueError("No V3 cells were generated. Check the date range and v3-people-per-cell value.")
+        outputs.extend(
+            render_v3_views(
+                simulation=simulation,
+                annual_totals=annual_totals,
+                first_year=first_year,
+                last_year=last_year,
+                args=args,
+                stem=stem,
+                views=selected_v3_views(args),
             )
         )
 
